@@ -1,0 +1,13 @@
+torch>=2.2.0
+torchvision>=0.17.0
+transformers>=4.44.0
+accelerate>=0.33.0
+peft>=0.11.0
+bitsandbytes>=0.43.0; platform_system=="Linux"
+numpy>=1.24.0
+timm>=0.9.10,<1.0.0
+tokenizers>=0.19.1
+Pillow>=10.2.0
+sentencepiece>=0.2.0
+protobuf>=4.25.0
+

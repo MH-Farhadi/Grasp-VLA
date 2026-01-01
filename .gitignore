@@ -21,5 +21,9 @@ rad.json
 #Test results file
 TestResults.xml
 
-# Dummy data folder
-dummy_data/
+# Local data folder
+raw_data/
+
+# Trained model checkpoints / runs
+checkpoints/
+!checkpoints/.gitkeep

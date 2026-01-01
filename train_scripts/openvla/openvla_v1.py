@@ -23,7 +23,8 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 
 # Allow running from anywhere (so `import dataloaders...` works even if cwd != repo root)
-REPO_ROOT = Path(__file__).resolve().parents[1]
+# This file lives under: train_scripts/openvla/openvla_v1.py
+REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 

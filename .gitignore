@@ -27,3 +27,7 @@ raw_data/
 # Trained model checkpoints / runs
 checkpoints/
 !checkpoints/.gitkeep
+
+# LeRobot dataset exports + training outputs
+lerobot_datasets/
+outputs/

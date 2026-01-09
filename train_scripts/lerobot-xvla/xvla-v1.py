@@ -39,7 +39,7 @@ from contextlib import nullcontext
 from dataclasses import asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -65,6 +65,199 @@ def _resolve_device(device_str: str) -> torch.device:
     if device_str.startswith("cuda") and not torch.cuda.is_available():
         return torch.device("cpu")
     return torch.device(device_str)
+
+
+def _read_json(path: Path) -> Dict[str, Any]:
+    with path.open("r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def _is_episode_dir(p: Path) -> bool:
+    return p.is_dir() and p.name.startswith("episode_")
+
+
+def _is_session_dir(p: Path) -> bool:
+    return p.is_dir() and p.name.startswith("session_")
+
+
+def _list_raw_episode_dirs(raw_data_dir: Path) -> List[Path]:
+    """
+    Supports:
+    - raw_data/episode_*
+    - raw_data/session_*/episode_*
+    - raw_data being a session dir itself
+    """
+    raw_data_dir = raw_data_dir.expanduser().resolve()
+    episode_dirs: List[Path] = []
+
+    # Episodes directly under the provided directory (old layout, or when passing a session dir)
+    episode_dirs.extend(sorted([p for p in raw_data_dir.iterdir() if _is_episode_dir(p)]))
+
+    # Episodes nested under session_* dirs (new multi-session layout)
+    for sdir in sorted([p for p in raw_data_dir.iterdir() if _is_session_dir(p)]):
+        episode_dirs.extend(sorted([p for p in sdir.iterdir() if _is_episode_dir(p)]))
+
+    # De-dupe while preserving order
+    seen: set[Path] = set()
+    out: List[Path] = []
+    for p in episode_dirs:
+        rp = p.resolve()
+        if rp in seen:
+            continue
+        seen.add(rp)
+        out.append(rp)
+    return out
+
+
+def _infer_log_rate_hz_from_metadata(raw_data_dir: Path) -> int:
+    """
+    Infer FPS from raw_data by reading metadata.json["config"]["log_rate_hz"].
+    Enforces that log_rate_hz is constant across all episodes discovered.
+    """
+    episode_dirs = _list_raw_episode_dirs(raw_data_dir)
+    if not episode_dirs:
+        raise FileNotFoundError(f"No episode_* directories found under {raw_data_dir}")
+
+    rates: set[int] = set()
+    missing = 0
+    for ep_dir in episode_dirs:
+        meta_path = ep_dir / "metadata.json"
+        if not meta_path.exists():
+            missing += 1
+            continue
+        try:
+            meta = _read_json(meta_path)
+            cfg = meta.get("config") or {}
+            lr = cfg.get("log_rate_hz")
+            if lr is None:
+                missing += 1
+                continue
+            rates.add(int(lr))
+        except Exception:
+            missing += 1
+
+    if not rates:
+        raise RuntimeError(
+            f"Could not infer fps from metadata.json (missing/invalid in {missing}/{len(episode_dirs)} episodes)."
+        )
+    if len(rates) != 1:
+        raise RuntimeError(f"Mixed metadata config.log_rate_hz values across dataset: {sorted(rates)}")
+    return next(iter(rates))
+
+
+def _load_policy_contract(policy_dir: Path) -> Dict[str, Any]:
+    """
+    Minimal "data contract" extraction from a local XVLA policy directory:
+    - expected feature keys + shapes (from config.json)
+    - expected task key (from policy_preprocessor.json, if present)
+    - chunking horizons
+    """
+    policy_dir = policy_dir.expanduser().resolve()
+    cfg_path = policy_dir / "config.json"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Missing policy config.json at: {cfg_path}")
+    cfg = _read_json(cfg_path)
+
+    input_features = cfg.get("input_features") or {}
+    output_features = cfg.get("output_features") or {}
+    chunk_size = int(cfg.get("chunk_size") or 1)
+    n_action_steps = int(cfg.get("n_action_steps") or 1)
+
+    task_key = "task"
+    preproc_path = policy_dir / "policy_preprocessor.json"
+    if preproc_path.exists():
+        try:
+            pre = _read_json(preproc_path)
+            for step in pre.get("steps") or []:
+                if (step.get("registry_name") or "") == "tokenizer_processor":
+                    task_key = str((step.get("config") or {}).get("task_key") or task_key)
+        except Exception:
+            # Best-effort: contract still mostly comes from config.json
+            task_key = "task"
+
+    return {
+        "policy_dir": str(policy_dir),
+        "task_key": task_key,
+        "input_features": input_features,
+        "output_features": output_features,
+        "chunk_size": chunk_size,
+        "n_action_steps": n_action_steps,
+    }
+
+
+def _read_dataset_info(dataset_dir: Path) -> Dict[str, Any]:
+    info_path = dataset_dir / "meta" / "info.json"
+    if not info_path.exists():
+        raise FileNotFoundError(f"Missing dataset meta/info.json at: {info_path}")
+    return _read_json(info_path)
+
+
+def _validate_dataset_info_against_contract(
+    dataset_info: Dict[str, Any],
+    *,
+    contract: Dict[str, Any],
+    expected_fps: Optional[int],
+    action_dim_override: Optional[int],
+) -> None:
+    ds_features = dataset_info.get("features") or {}
+    required = set((contract.get("input_features") or {}).keys()) | set((contract.get("output_features") or {}).keys())
+
+    missing = sorted([k for k in required if k not in ds_features])
+    if missing:
+        raise RuntimeError(
+            "Dataset is missing required feature keys expected by the policy:\n"
+            + "\n".join([f"  - {k}" for k in missing])
+            + "\n\nFix: re-run with --overwrite_dataset to rebuild the LeRobotDataset with the correct schema."
+        )
+
+    if expected_fps is not None:
+        ds_fps = dataset_info.get("fps")
+        if ds_fps is None or int(ds_fps) != int(expected_fps):
+            raise RuntimeError(f"Dataset fps={ds_fps} does not match expected fps={expected_fps}")
+
+    def _expect_chw(key: str, spec: Dict[str, Any]) -> None:
+        chw = spec.get("shape") or []
+        if len(chw) != 3:
+            raise RuntimeError(f"Policy expects {key} with CHW shape, got shape={chw}")
+        c, h, w = (int(chw[0]), int(chw[1]), int(chw[2]))
+        ds_spec = ds_features.get(key) or {}
+        ds_dtype = ds_spec.get("dtype")
+        if ds_dtype != "image":
+            raise RuntimeError(f"{key}: dataset dtype={ds_dtype} but expected dtype='image'")
+        ds_shape = ds_spec.get("shape") or []
+        if len(ds_shape) != 3:
+            raise RuntimeError(f"Dataset feature {key} has unexpected shape={ds_shape} (expected HWC)")
+        dh, dw, dc = (int(ds_shape[0]), int(ds_shape[1]), int(ds_shape[2]))
+        if dc != c:
+            raise RuntimeError(f"{key}: dataset channels={dc} but policy expects channels={c}")
+        if dh != h or dw != w:
+            raise RuntimeError(f"{key}: dataset HWC={(dh, dw, dc)} but policy expects CHW={(c, h, w)}")
+
+    def _expect_1d(key: str, spec: Dict[str, Any], *, override_dim: Optional[int] = None) -> None:
+        shp = spec.get("shape") or []
+        if len(shp) != 1:
+            raise RuntimeError(f"Policy expects {key} with 1D shape, got shape={shp}")
+        expected_dim = int(override_dim) if override_dim is not None else int(shp[0])
+        ds_spec = ds_features.get(key) or {}
+        ds_dtype = ds_spec.get("dtype")
+        if ds_dtype != "float32":
+            raise RuntimeError(f"{key}: dataset dtype={ds_dtype} but expected dtype='float32'")
+        ds_shape = ds_spec.get("shape") or []
+        if len(ds_shape) != 1 or int(ds_shape[0]) != expected_dim:
+            raise RuntimeError(f"{key}: dataset shape={ds_shape} but policy expects ({expected_dim},)")
+
+    # Validate shapes for each required feature.
+    for k, spec in (contract.get("input_features") or {}).items():
+        ftype = (spec.get("type") or "").upper()
+        if ftype == "VISUAL":
+            _expect_chw(k, spec)
+        elif ftype == "STATE":
+            _expect_1d(k, spec)
+
+    for k, spec in (contract.get("output_features") or {}).items():
+        ftype = (spec.get("type") or "").upper()
+        if ftype == "ACTION":
+            _expect_1d(k, spec, override_dim=action_dim_override)
 
 
 def _reinit_soft_prompt_row(policy: Any, *, domain_id: int, std: float = 0.02) -> None:
@@ -219,10 +412,35 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--raw_data_dir", type=str, default="raw_data")
     p.add_argument("--dataset_dir", type=str, default="lerobot_datasets/grasp_raw")
     p.add_argument("--dataset_repo_id", type=str, default="grasp_raw")
-    p.add_argument("--fps", type=int, default=5)
-    p.add_argument("--camera_key", type=str, default="image")
+    p.add_argument(
+        "--fps",
+        type=int,
+        default=None,
+        help="Dataset FPS. If omitted, inferred from raw_data metadata.json config.log_rate_hz (recommended).",
+    )
+    p.add_argument("--camera_key", type=str, default="image", help="Suffix for observation.images.<key> (XVLA expects 'image').")
     p.add_argument("--overwrite_dataset", action="store_true")
     p.add_argument("--skip_convert", action="store_true")
+    p.add_argument("--max_episodes", type=int, default=None, help="Limit number of episodes during conversion (debug/overfit).")
+    p.add_argument(
+        "--min_frames_per_episode",
+        type=int,
+        default=None,
+        help="Drop episodes shorter than this many frames (if omitted, defaults to the policy chunk_size when available).",
+    )
+    p.add_argument(
+        "--max_frames_per_episode", type=int, default=None, help="Limit frames per episode during conversion (debug/overfit)."
+    )
+    p.add_argument("--raw_quality_gate", action="store_true", default=True, help="Run strict raw log checks before conversion.")
+    p.add_argument("--no_raw_quality_gate", action="store_true", help="Disable raw log checks (not recommended).")
+    p.add_argument(
+        "--drop_truncated",
+        action="store_true",
+        default=True,
+        help="Skip episodes with episode_end.truncated=true (recommended for clean imitation).",
+    )
+    p.add_argument("--keep_truncated", action="store_true", help="Keep truncated episodes.")
+    p.add_argument("--success_only", action="store_true", default=False, help="Only train on episodes with grasp_result.ok=true.")
 
     # Model / run
     p.add_argument("--policy_path", type=str, default="lerobot/xvla-base")
@@ -246,6 +464,8 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--grad_clip_norm", type=float, default=10.0)
     p.add_argument("--use_amp", action="store_true", help="Enable autocast on CUDA (in addition to dtype setting)")
     p.add_argument("--log_every", type=int, default=20)
+    p.add_argument("--smoke_test", action="store_true", default=True, help="Run a 1-batch contract/preprocessor/policy forward pass check.")
+    p.add_argument("--no_smoke_test", action="store_true", help="Disable the initial smoke test.")
 
     p.add_argument("--stage1_steps", type=int, default=500)
     p.add_argument("--stage1_lr", type=float, default=1e-4)
@@ -276,27 +496,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     raw_data_dir = Path(args.raw_data_dir).expanduser().resolve()
     dataset_dir = Path(args.dataset_dir).expanduser().resolve()
 
-    if not args.skip_convert:
-        if dataset_dir.exists() and not args.overwrite_dataset:
-            print(
-                f"Dataset directory already exists: {dataset_dir}\n"
-                "Skipping conversion. (Pass --overwrite_dataset to delete & recreate, or --skip_convert to silence this.)"
-            )
-        else:
-            convert(
-                raw_data_dir=raw_data_dir,
-                out_dir=dataset_dir,
-                repo_id=args.dataset_repo_id,
-                fps=args.fps,
-                camera_key=args.camera_key,
-                overwrite=args.overwrite_dataset,
-            )
-
-    # Resolve device (and allow auto-fallback to cpu if cuda isn't available).
     device = _resolve_device(args.device)
     pin_memory = device.type == "cuda"
 
-    # Prefetch the policy directory (optional, but avoids long silent downloads).
+    # Prefetch the policy directory early (so we can validate the "data contract" before conversion).
     policy_path = args.policy_path
     do_prefetch = bool(args.prefetch_policy) and not bool(args.no_prefetch_policy)
     use_hf_transfer = bool(args.hf_transfer) and not bool(args.no_hf_transfer)
@@ -315,6 +518,125 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"Policy cached at: {policy_path}")
         except Exception as e:
             print(f"WARNING: prefetch failed ({e}). Continuing; weights may download during startup.")
+
+    policy_dir = Path(str(policy_path)).expanduser().resolve()
+    policy_contract: Optional[Dict[str, Any]] = None
+    if policy_dir.is_dir():
+        try:
+            policy_contract = _load_policy_contract(policy_dir)
+            print(
+                "Policy contract:"
+                f" chunk_size={policy_contract['chunk_size']}"
+                f" n_action_steps={policy_contract['n_action_steps']}"
+                f" inputs={sorted(list((policy_contract['input_features'] or {}).keys()))}"
+                f" outputs={sorted(list((policy_contract['output_features'] or {}).keys()))}"
+            )
+        except Exception as e:
+            print(f"WARNING: could not load policy contract from {policy_dir} ({e}). Skipping contract checks.")
+            policy_contract = None
+
+    # Determine dataset FPS. Do NOT infer from wall-clock tick timestamps (t_ms); use metadata.json config.log_rate_hz.
+    fps = int(args.fps) if args.fps is not None else _infer_log_rate_hz_from_metadata(raw_data_dir)
+    if args.fps is None:
+        print(f"Inferred fps={fps} from raw_data metadata.json config.log_rate_hz")
+
+    # Derive conversion shapes from the policy contract when available (matches xvla-base expectations).
+    image_wh: Tuple[int, int] = (256, 256)
+    image2_wh: Optional[Tuple[int, int]] = (256, 256)
+    empty0_wh: Optional[Tuple[int, int]] = (224, 224)
+    state_dim = 8
+    if policy_contract is not None:
+        in_feats = policy_contract.get("input_features") or {}
+        out_feats = policy_contract.get("output_features") or {}
+
+        img_key = f"observation.images.{args.camera_key}"
+        if img_key not in in_feats:
+            expected_imgs = sorted([k for k in in_feats.keys() if k.startswith("observation.images.")])
+            raise RuntimeError(
+                f"Policy expects image key '{img_key}' but it is missing from config.json input_features.\n"
+                f"Available image keys: {expected_imgs}\n"
+                f"Fix by using --camera_key=image (or convert with a matching key + a rename_map)."
+            )
+        img_shape = (in_feats.get(img_key) or {}).get("shape") or []
+        if len(img_shape) != 3:
+            raise RuntimeError(f"Unexpected policy image shape for {img_key}: {img_shape} (expected CHW)")
+        image_wh = (int(img_shape[2]), int(img_shape[1]))  # (W,H)
+
+        if "observation.images.image2" in in_feats:
+            s = (in_feats.get("observation.images.image2") or {}).get("shape") or []
+            image2_wh = (int(s[2]), int(s[1])) if len(s) == 3 else None
+        else:
+            image2_wh = None
+
+        if "observation.images.empty_camera_0" in in_feats:
+            s = (in_feats.get("observation.images.empty_camera_0") or {}).get("shape") or []
+            empty0_wh = (int(s[2]), int(s[1])) if len(s) == 3 else None
+        else:
+            empty0_wh = None
+
+        state_shape = (in_feats.get("observation.state") or {}).get("shape") or []
+        if len(state_shape) == 1:
+            state_dim = int(state_shape[0])
+
+        ckpt_action_shape = (out_feats.get("action") or {}).get("shape") or []
+        if len(ckpt_action_shape) == 1 and int(ckpt_action_shape[0]) != int(args.max_action_dim):
+            print(
+                f"WARNING: policy checkpoint action dim={int(ckpt_action_shape[0])} but --max_action_dim={int(args.max_action_dim)}. "
+                "Conversion will follow --max_action_dim."
+            )
+
+    raw_quality_gate = bool(args.raw_quality_gate) and not bool(args.no_raw_quality_gate)
+    drop_truncated = bool(args.drop_truncated) and not bool(args.keep_truncated)
+    min_frames_per_episode = args.min_frames_per_episode
+    if min_frames_per_episode is None and policy_contract is not None:
+        try:
+            cs = int(policy_contract.get("chunk_size") or 0)
+            if cs > 0:
+                min_frames_per_episode = cs
+        except Exception:
+            min_frames_per_episode = None
+
+    # Convert raw_data -> LeRobotDataset (optional).
+    if not args.skip_convert:
+        if dataset_dir.exists() and not args.overwrite_dataset:
+            print(
+                f"Dataset directory already exists: {dataset_dir}\n"
+                "Skipping conversion. (Pass --overwrite_dataset to delete & recreate, or --skip_convert to silence this.)"
+            )
+        else:
+            convert(
+                raw_data_dir=raw_data_dir,
+                out_dir=dataset_dir,
+                repo_id=args.dataset_repo_id,
+                fps=int(fps),
+                camera_key=args.camera_key,
+                image_wh=image_wh,
+                image2_wh=image2_wh,
+                empty_camera_0_wh=empty0_wh,
+                state_dim=int(state_dim),
+                action_dim=int(args.max_action_dim),
+                raw_quality_gate=raw_quality_gate,
+                drop_truncated=drop_truncated,
+                success_only=bool(args.success_only),
+                max_episodes=args.max_episodes,
+                min_frames_per_episode=min_frames_per_episode,
+                max_frames_per_episode=args.max_frames_per_episode,
+                overwrite=args.overwrite_dataset,
+            )
+
+    if not dataset_dir.exists():
+        raise FileNotFoundError(f"Dataset directory does not exist: {dataset_dir} (did conversion run?)")
+
+    # Fast fail: validate the dataset on disk matches the policy's expected feature keys/shapes.
+    if policy_contract is not None:
+        ds_info = _read_dataset_info(dataset_dir)
+        _validate_dataset_info_against_contract(
+            ds_info,
+            contract=policy_contract,
+            expected_fps=int(fps),
+            action_dim_override=int(args.max_action_dim),
+        )
+        print("Dataset contract check: OK")
 
     # Load dataset (from disk).
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
@@ -383,6 +705,59 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         preprocessor_overrides=pre_overrides,
         postprocessor_overrides=post_overrides,
     )
+
+    # -------------------------
+    # Contract + pipeline smoke test
+    # -------------------------
+    do_smoke_test = bool(args.smoke_test) and not bool(args.no_smoke_test)
+    if do_smoke_test:
+        def _describe_val(v: Any) -> str:
+            if isinstance(v, torch.Tensor):
+                return f"torch{tuple(v.shape)} {str(v.dtype)}"
+            if isinstance(v, (list, tuple)):
+                if not v:
+                    return f"{type(v).__name__} len=0"
+                t0 = type(v[0]).__name__
+                return f"{type(v).__name__} len={len(v)} (first={t0})"
+            return type(v).__name__
+
+        def _print_key_shapes(tag: str, batch: Any) -> None:
+            keys_of_interest = (
+                "task",
+                "observation.images.image",
+                "observation.images.image2",
+                "observation.images.empty_camera_0",
+                "observation.state",
+                "action",
+                "domain_id",
+                "input_ids",
+                "attention_mask",
+                "labels",
+            )
+            print(f"{tag}:")
+            if isinstance(batch, dict):
+                for k in keys_of_interest:
+                    if k in batch:
+                        print(f"  - {k}: {_describe_val(batch[k])}")
+                extra = [k for k in batch.keys() if k not in keys_of_interest]
+                if extra:
+                    print(f"  - (other keys): {sorted(extra)[:20]}")
+            else:
+                print(f"  - (non-dict batch): {_describe_val(batch)}")
+
+        print("Running smoke test: one batch -> preprocessor -> policy.forward()")
+        try:
+            batch0 = next(iter(dl))
+            _print_key_shapes("Raw batch", batch0)
+            batch1 = preprocessor(batch0)
+            _print_key_shapes("After preprocessor", batch1)
+            with torch.no_grad():
+                loss, _log_dict = policy.forward(batch1)
+            if not torch.isfinite(loss).all():
+                raise RuntimeError(f"Non-finite loss: {loss}")
+            print(f"Smoke test OK: loss={float(loss):.6f}")
+        except Exception as e:
+            raise RuntimeError(f"Smoke test failed: {e}") from e
 
     # Output directories
     out_root = _unique_out_dir(Path(args.output_dir).expanduser().resolve())

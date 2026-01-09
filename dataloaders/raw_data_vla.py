@@ -1,11 +1,14 @@
 """
-Raw-data VLA dataset loader for this repo's `raw_data/episode_*/` format.
+Raw-data VLA dataset loader for this repo's raw_data formats.
 
 Observed structure:
 - `raw_data/episode_XXXX/instruction.json` contains `language_command`
 - `raw_data/episode_XXXX/ticks.jsonl` contains per-tick records with:
   - `image.path` (relative path to a PNG under the episode dir)
   - `policy.action_from_prev` (Δpos, Δrotvec, gripper_action)
+
+Also supported:
+- `raw_data/session_YYYYMMDD_HHMMSS/episode_XXXX/...` (multiple sessions under one root)
 """
 
 from __future__ import annotations
@@ -198,12 +201,26 @@ class RawDataVLADataset(Dataset):
         self.data_dir = data_dir
         self.samples: List[Sample] = []
 
-        episode_dirs = sorted(
-            [p for p in data_dir.iterdir() if p.is_dir() and p.name.startswith("episode_")]
-        )
+        def _is_episode_dir(p: Path) -> bool:
+            return p.is_dir() and p.name.startswith("episode_")
+
+        def _is_session_dir(p: Path) -> bool:
+            return p.is_dir() and p.name.startswith("session_")
+
+        # Support both:
+        # - data_dir/episode_* (old layout, or passing a session dir)
+        # - data_dir/session_*/episode_* (new multi-session layout)
+        episode_dirs: List[Path] = []
+        episode_dirs.extend(sorted([p for p in data_dir.iterdir() if _is_episode_dir(p)]))
+        for sdir in sorted([p for p in data_dir.iterdir() if _is_session_dir(p)]):
+            episode_dirs.extend(sorted([p for p in sdir.iterdir() if _is_episode_dir(p)]))
+
         if not episode_dirs:
             raise FileNotFoundError(
-                f"No episode directories found under: {data_dir} (expected episode_*)"
+                f"No episode directories found under: {data_dir}\n"
+                "Expected either:\n"
+                "  - raw_data/episode_XXXX/\n"
+                "  - raw_data/session_*/episode_XXXX/\n"
             )
 
         for ep_dir in episode_dirs:

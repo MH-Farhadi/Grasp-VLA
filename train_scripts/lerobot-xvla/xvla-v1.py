@@ -347,11 +347,90 @@ def _make_dataloader(dataset: Any, *, batch_size: int, num_workers: int, seed: i
     )
 
 
+def _make_eval_dataloader(
+    dataset: Any, *, batch_size: int, num_workers: int, pin_memory: bool
+) -> torch.utils.data.DataLoader:
+    return torch.utils.data.DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+        drop_last=False,
+    )
+
+
+def _split_episode_indices(*, num_episodes: int, val_split: float, seed: int) -> Tuple[List[int], List[int]]:
+    if num_episodes <= 0:
+        return [], []
+    if val_split <= 0:
+        return list(range(num_episodes)), []
+    if val_split >= 1:
+        return [], list(range(num_episodes))
+
+    n_val = int(round(float(num_episodes) * float(val_split)))
+    n_val = max(1, min(int(num_episodes) - 1, int(n_val)))
+
+    rng = random.Random(int(seed))
+    eps = list(range(int(num_episodes)))
+    rng.shuffle(eps)
+    val_eps = sorted(eps[:n_val])
+    train_eps = sorted(eps[n_val:])
+    return train_eps, val_eps
+
+
+@torch.no_grad()
+def _eval_loss(
+    *,
+    policy: Any,
+    preprocessor: Any,
+    dataloader: torch.utils.data.DataLoader,
+    max_batches: Optional[int],
+    use_amp: bool,
+) -> Tuple[float, Dict[str, float]]:
+    policy.eval()
+    device = next(policy.parameters()).device
+    amp_ctx = (
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        if (use_amp and device.type == "cuda")
+        else nullcontext()
+    )
+
+    total = 0.0
+    n = 0
+    sums: Dict[str, float] = {}
+
+    max_batches_i = None if (max_batches is None or int(max_batches) <= 0) else int(max_batches)
+    for b_idx, batch in enumerate(dataloader):
+        if max_batches_i is not None and b_idx >= max_batches_i:
+            break
+        batch = preprocessor(batch)
+        with amp_ctx:
+            loss, log_dict = policy.forward(batch)
+        total += float(loss.detach().item())
+        n += 1
+        if isinstance(log_dict, dict):
+            for k, v in log_dict.items():
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                sums[k] = sums.get(k, 0.0) + fv
+
+    if n <= 0:
+        return float("nan"), {}
+    avg = total / n
+    avg_logs = {k: v / n for k, v in sums.items()}
+    avg_logs.setdefault("loss", avg)
+    return avg, avg_logs
+
+
 def _train_steps(
     *,
     policy: Any,
     preprocessor: Any,
     dataloader: torch.utils.data.DataLoader,
+    eval_dataloader: Optional[torch.utils.data.DataLoader],
     optimizer: torch.optim.Optimizer,
     scheduler: Optional[Any],
     steps: int,
@@ -359,6 +438,11 @@ def _train_steps(
     grad_clip_norm: float,
     use_amp: bool,
     log_every: int,
+    eval_every_steps: int,
+    eval_every_epochs: int,
+    eval_max_batches: Optional[int],
+    eval_at_end: bool,
+    tag: str,
 ) -> None:
     if steps <= 0:
         return
@@ -375,6 +459,18 @@ def _train_steps(
     policy.train()
     optimizer.zero_grad(set_to_none=True)
 
+    steps_per_epoch = 0
+    try:
+        steps_per_epoch = int(len(dataloader))
+    except Exception:
+        steps_per_epoch = 0
+
+    epoch_idx = 0
+    epoch_loss_sum = 0.0
+    epoch_loss_n = 0
+    epoch_sums: Dict[str, float] = {}
+    last_eval_step = 0
+
     dl_iter = iter(dataloader)
     for step_idx in range(1, steps + 1):
         try:
@@ -390,6 +486,19 @@ def _train_steps(
             loss_to_backprop = loss / grad_accum
         loss_to_backprop.backward()
 
+        # Track running stats inside the current epoch window (epoch := one full pass through the dataloader).
+        epoch_loss_sum += float(loss.detach().item())
+        epoch_loss_n += 1
+        if isinstance(log_dict, dict):
+            for k, v in log_dict.items():
+                if k == "loss":
+                    continue
+                try:
+                    fv = float(v)
+                except Exception:
+                    continue
+                epoch_sums[k] = epoch_sums.get(k, 0.0) + fv
+
         if step_idx % grad_accum == 0:
             if grad_clip_norm and grad_clip_norm > 0:
                 torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip_norm)
@@ -403,6 +512,75 @@ def _train_steps(
             if isinstance(log_dict, dict) and "loss" in log_dict:
                 extra = f" (sub_losses={{{', '.join([f'{k}:{v:.4f}' for k,v in log_dict.items() if k!='loss'])}}})"
             print(f"[step {step_idx:06d}/{steps}] loss={float(loss):.6f}{extra}")
+
+        # Epoch boundary reporting.
+        is_epoch_end = bool(steps_per_epoch > 0 and (step_idx % steps_per_epoch == 0))
+        if is_epoch_end:
+            epoch_idx += 1
+            train_epoch_loss = (epoch_loss_sum / max(1, epoch_loss_n)) if epoch_loss_n > 0 else float("nan")
+            epoch_extra = ""
+            if epoch_sums:
+                avg_sub = {k: v / max(1, epoch_loss_n) for k, v in epoch_sums.items()}
+                epoch_extra = " (sub_losses={" + ", ".join([f"{k}:{v:.4f}" for k, v in avg_sub.items()]) + "})"
+            print(
+                f"[{tag}] epoch {epoch_idx} end: train_loss={train_epoch_loss:.6f}{epoch_extra}"
+                + (f" (steps_per_epoch={steps_per_epoch})" if steps_per_epoch > 0 else "")
+            )
+            epoch_loss_sum = 0.0
+            epoch_loss_n = 0
+            epoch_sums = {}
+
+            if eval_dataloader is not None and int(eval_every_epochs) > 0 and (epoch_idx % int(eval_every_epochs) == 0):
+                val_loss, val_logs = _eval_loss(
+                    policy=policy,
+                    preprocessor=preprocessor,
+                    dataloader=eval_dataloader,
+                    max_batches=eval_max_batches,
+                    use_amp=use_amp,
+                )
+                sub = {k: v for k, v in val_logs.items() if k != "loss"}
+                extra = " (sub_losses={" + ", ".join([f"{k}:{v:.4f}" for k, v in sub.items()]) + "})" if sub else ""
+                print(f"[{tag}] epoch {epoch_idx} val_loss={val_loss:.6f}{extra}")
+                last_eval_step = step_idx
+                policy.train()
+
+        # Step-based evaluation (useful when training for < 1 full epoch).
+        if (
+            eval_dataloader is not None
+            and int(eval_every_steps) > 0
+            and (step_idx % int(eval_every_steps) == 0)
+            and step_idx != last_eval_step
+        ):
+            val_loss, val_logs = _eval_loss(
+                policy=policy,
+                preprocessor=preprocessor,
+                dataloader=eval_dataloader,
+                max_batches=eval_max_batches,
+                use_amp=use_amp,
+            )
+            sub = {k: v for k, v in val_logs.items() if k != "loss"}
+            extra = " (sub_losses={" + ", ".join([f"{k}:{v:.4f}" for k, v in sub.items()]) + "})" if sub else ""
+            approx_epoch = (step_idx / steps_per_epoch) if steps_per_epoch > 0 else 0.0
+            print(f"[{tag}] step {step_idx}/{steps} (~epoch {approx_epoch:.3f}) val_loss={val_loss:.6f}{extra}")
+            last_eval_step = step_idx
+            policy.train()
+
+    if steps_per_epoch > 0:
+        approx_epochs = steps / steps_per_epoch
+        print(f"[{tag}] done: {steps} steps (~{approx_epochs:.3f} epochs)")
+
+    if eval_dataloader is not None and bool(eval_at_end) and last_eval_step != int(steps):
+        val_loss, val_logs = _eval_loss(
+            policy=policy,
+            preprocessor=preprocessor,
+            dataloader=eval_dataloader,
+            max_batches=eval_max_batches,
+            use_amp=use_amp,
+        )
+        sub = {k: v for k, v in val_logs.items() if k != "loss"}
+        extra = " (sub_losses={" + ", ".join([f"{k}:{v:.4f}" for k, v in sub.items()]) + "})" if sub else ""
+        print(f"[{tag}] final val_loss={val_loss:.6f}{extra}")
+        policy.train()
 
 
 def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
@@ -466,6 +644,32 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--log_every", type=int, default=20)
     p.add_argument("--smoke_test", action="store_true", default=True, help="Run a 1-batch contract/preprocessor/policy forward pass check.")
     p.add_argument("--no_smoke_test", action="store_true", help="Disable the initial smoke test.")
+
+    # Evaluation / validation
+    p.add_argument(
+        "--val_split",
+        type=float,
+        default=0.1,
+        help="Hold out this fraction of episodes for validation (0 disables; split is by episode_index).",
+    )
+    p.add_argument("--val_seed", type=int, default=None, help="Seed for selecting validation episodes (default: --seed).")
+    p.add_argument("--eval_only", action="store_true", help="Only run evaluation (no training / no reinit).")
+    p.add_argument("--eval_batch_size", type=int, default=None, help="Batch size for evaluation (defaults to --batch_size).")
+    p.add_argument("--eval_every_steps", type=int, default=0, help="Run validation every N training steps (0 disables).")
+    p.add_argument(
+        "--eval_every_epochs",
+        type=int,
+        default=1,
+        help="Run validation every N epochs (epoch := one full pass through the train dataloader).",
+    )
+    p.add_argument(
+        "--eval_max_batches",
+        type=int,
+        default=200,
+        help="Limit validation to this many batches for speed (0 = full validation set).",
+    )
+    p.add_argument("--eval_at_end", action="store_true", default=True, help="Run validation at the end of each training phase.")
+    p.add_argument("--no_eval_at_end", action="store_true", help="Disable end-of-phase validation.")
 
     p.add_argument("--stage1_steps", type=int, default=500)
     p.add_argument("--stage1_lr", type=float, default=1e-4)
@@ -641,13 +845,37 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # Load dataset (from disk).
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    ds = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, download_videos=False)
+    val_split = float(args.val_split)
+    val_seed = int(args.val_seed) if args.val_seed is not None else int(args.seed)
+    ds_val: Optional[LeRobotDataset] = None
+
+    if val_split > 0:
+        # Load a tiny slice just to read metadata.total_episodes without mmap'ing the full dataset.
+        ds_meta = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, episodes=[0], download_videos=False)
+        total_eps = int(ds_meta.meta.total_episodes)
+        train_eps, val_eps = _split_episode_indices(num_episodes=total_eps, val_split=val_split, seed=val_seed)
+        print(f"Episode split: train={len(train_eps)} val={len(val_eps)} (val_split={val_split:g}, seed={val_seed})")
+        ds = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, episodes=train_eps, download_videos=False)
+        ds_val = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, episodes=val_eps, download_videos=False)
+    else:
+        print(f"Episode split disabled (val_split={val_split:g}). Using all episodes for training.")
+        ds = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, download_videos=False)
+
     dl = _make_dataloader(
         ds,
         batch_size=int(args.batch_size),
         num_workers=int(args.num_workers),
         seed=int(args.seed),
         pin_memory=pin_memory,
+    )
+    eval_bs = int(args.eval_batch_size) if args.eval_batch_size is not None else int(args.batch_size)
+    dl_train_eval = _make_eval_dataloader(
+        ds, batch_size=eval_bs, num_workers=int(args.num_workers), pin_memory=pin_memory
+    )
+    dl_val = (
+        _make_eval_dataloader(ds_val, batch_size=eval_bs, num_workers=int(args.num_workers), pin_memory=pin_memory)
+        if ds_val is not None
+        else None
     )
 
     # Load policy config from the pretrained policy and override a few run-time knobs.
@@ -759,6 +987,35 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         except Exception as e:
             raise RuntimeError(f"Smoke test failed: {e}") from e
 
+    do_eval_at_end = bool(args.eval_at_end) and not bool(args.no_eval_at_end)
+    if bool(args.eval_only):
+        print("Eval-only mode: computing loss on train (and val, if configured)")
+        train_loss, train_logs = _eval_loss(
+            policy=policy,
+            preprocessor=preprocessor,
+            dataloader=dl_train_eval,
+            max_batches=int(args.eval_max_batches),
+            use_amp=bool(args.use_amp),
+        )
+        sub = {k: v for k, v in train_logs.items() if k != "loss"}
+        extra = " (sub_losses={" + ", ".join([f"{k}:{v:.4f}" for k, v in sub.items()]) + "})" if sub else ""
+        print(f"[eval] train_loss={train_loss:.6f}{extra}")
+
+        if dl_val is not None:
+            val_loss, val_logs = _eval_loss(
+                policy=policy,
+                preprocessor=preprocessor,
+                dataloader=dl_val,
+                max_batches=int(args.eval_max_batches),
+                use_amp=bool(args.use_amp),
+            )
+            sub = {k: v for k, v in val_logs.items() if k != "loss"}
+            extra = " (sub_losses={" + ", ".join([f"{k}:{v:.4f}" for k, v in sub.items()]) + "})" if sub else ""
+            print(f"[eval] val_loss={val_loss:.6f}{extra}")
+        else:
+            print("[eval] No validation split configured (set --val_split > 0 to enable).")
+        return 0
+
     # Output directories
     out_root = _unique_out_dir(Path(args.output_dir).expanduser().resolve())
     stage1_dir = out_root / "stage1"
@@ -814,6 +1071,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         policy=policy,
         preprocessor=preprocessor,
         dataloader=dl,
+        eval_dataloader=dl_val,
         optimizer=optimizer1,
         scheduler=scheduler1,
         steps=int(args.stage1_steps),
@@ -821,6 +1079,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         grad_clip_norm=float(args.grad_clip_norm),
         use_amp=bool(args.use_amp),
         log_every=int(args.log_every),
+        eval_every_steps=int(args.eval_every_steps),
+        eval_every_epochs=int(args.eval_every_epochs),
+        eval_max_batches=int(args.eval_max_batches),
+        eval_at_end=do_eval_at_end,
+        tag="stage1",
     )
 
     _save_policy_and_processors(stage1_dir, policy, preprocessor, postprocessor)
@@ -880,6 +1143,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         policy=policy,
         preprocessor=preprocessor,
         dataloader=dl,
+        eval_dataloader=dl_val,
         optimizer=optimizer2,
         scheduler=scheduler2,
         steps=int(args.stage2_steps),
@@ -887,6 +1151,11 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         grad_clip_norm=float(args.grad_clip_norm),
         use_amp=bool(args.use_amp),
         log_every=int(args.log_every),
+        eval_every_steps=int(args.eval_every_steps),
+        eval_every_epochs=int(args.eval_every_epochs),
+        eval_max_batches=int(args.eval_max_batches),
+        eval_at_end=do_eval_at_end,
+        tag="stage2",
     )
 
     _save_policy_and_processors(stage2_dir, policy, preprocessor, postprocessor)

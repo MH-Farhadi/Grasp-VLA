@@ -53,3 +53,17 @@ python train_scripts/pi-zero/pizero-v1.py --model_id <HF_OR_LOCAL_PIZERO_ID> --d
 ```bash
 python train_scripts/X-VLA/X_VLA_v1.py --model_id <HF_OR_LOCAL_XVLA_ID> --dry_run
 ```
+
+### LeRobot X-VLA (XVLA v1)
+
+If you already converted `raw_data/` into a LeRobotDataset, you can skip rebuilding the dataset and train with a fixed validation holdout (40 episodes):
+
+```bash
+python train_scripts/lerobot-xvla/xvla-v1.py \
+  --skip_convert \
+  --dataset_dir lerobot_datasets/grasp_raw \
+  --dataset_repo_id grasp_raw \
+  --policy_path lerobot/xvla-base \
+  --output_dir outputs/xvla_v1_run \
+  --val_episodes 40
+```

@@ -360,16 +360,27 @@ def _make_eval_dataloader(
     )
 
 
-def _split_episode_indices(*, num_episodes: int, val_split: float, seed: int) -> Tuple[List[int], List[int]]:
+def _split_episode_indices(
+    *,
+    num_episodes: int,
+    val_split: float,
+    val_episodes: Optional[int],
+    seed: int,
+) -> Tuple[List[int], List[int]]:
     if num_episodes <= 0:
         return [], []
-    if val_split <= 0:
+    if val_episodes is not None:
+        n_val = int(val_episodes)
+        if n_val <= 0:
+            return list(range(num_episodes)), []
+        n_val = max(1, min(int(num_episodes) - 1, int(n_val)))
+    elif val_split <= 0:
         return list(range(num_episodes)), []
-    if val_split >= 1:
+    elif val_split >= 1:
         return [], list(range(num_episodes))
-
-    n_val = int(round(float(num_episodes) * float(val_split)))
-    n_val = max(1, min(int(num_episodes) - 1, int(n_val)))
+    else:
+        n_val = int(round(float(num_episodes) * float(val_split)))
+        n_val = max(1, min(int(num_episodes) - 1, int(n_val)))
 
     rng = random.Random(int(seed))
     eps = list(range(int(num_episodes)))
@@ -423,6 +434,121 @@ def _eval_loss(
     avg_logs = {k: v / n for k, v in sums.items()}
     avg_logs.setdefault("loss", avg)
     return avg, avg_logs
+
+
+def _fmt_tensor_head(x: torch.Tensor, *, max_elems: int = 8) -> str:
+    x = x.detach().float().cpu().flatten()
+    n = int(x.numel())
+    k = min(int(max_elems), n)
+    head = ", ".join([f"{float(v): .4f}" for v in x[:k]])
+    if n > k:
+        head += ", ..."
+    return f"[{head}] (n={n})"
+
+
+@torch.no_grad()
+def _example_episode_report(
+    *,
+    policy: Any,
+    preprocessor: Any,
+    postprocessor: Any,
+    dataset_dir: Path,
+    dataset_repo_id: str,
+    episode_index: int,
+    device: torch.device,
+    use_amp: bool,
+    max_frames: int,
+    print_frames: int,
+) -> None:
+    from lerobot.datasets.lerobot_dataset import LeRobotDataset
+
+    ds_ep = LeRobotDataset(repo_id=dataset_repo_id, root=dataset_dir, episodes=[int(episode_index)], download_videos=False)
+    dl_ep = _make_eval_dataloader(ds_ep, batch_size=1, num_workers=0, pin_memory=(device.type == "cuda"))
+
+    if hasattr(policy, "reset"):
+        try:
+            policy.reset()
+        except Exception:
+            pass
+
+    amp_ctx = (
+        torch.autocast(device_type=device.type, dtype=torch.bfloat16)
+        if (use_amp and device.type == "cuda")
+        else nullcontext()
+    )
+
+    mae_sum = 0.0
+    mse_sum = 0.0
+    n = 0
+    last_task = None
+
+    max_frames_i = None if int(max_frames) <= 0 else int(max_frames)
+    print_frames_i = max(0, int(print_frames))
+
+    for i, raw_batch in enumerate(dl_ep):
+        if max_frames_i is not None and i >= max_frames_i:
+            break
+
+        # raw_batch contains the unnormalized ground-truth action
+        gt_action = raw_batch.get("action")
+
+        batch = preprocessor(raw_batch)
+
+        # Predict action (raw policy output) then postprocess to robot/action space.
+        with amp_ctx:
+            pred_raw = policy.select_action(batch)
+        pred = postprocessor(pred_raw)
+
+        if last_task is None:
+            last_task = (raw_batch.get("task") or [None])[0]
+
+        if isinstance(gt_action, torch.Tensor) and isinstance(pred, torch.Tensor):
+            # Compare in postprocessed (robot) space vs raw dataset action.
+            gt = gt_action.to(pred.device)
+            # Ensure same shape (B, D)
+            if pred.ndim == 1:
+                pred_cmp = pred.unsqueeze(0)
+            else:
+                pred_cmp = pred
+            if gt.ndim == 1:
+                gt_cmp = gt.unsqueeze(0)
+            else:
+                gt_cmp = gt
+            d = min(pred_cmp.shape[-1], gt_cmp.shape[-1])
+            err = pred_cmp[..., :d] - gt_cmp[..., :d]
+            mae = err.abs().mean().item()
+            mse = (err * err).mean().item()
+            mae_sum += float(mae)
+            mse_sum += float(mse)
+            n += 1
+
+        if i < print_frames_i:
+            ep_idx = raw_batch.get("episode_index")
+            fr_idx = raw_batch.get("frame_index")
+            ep_v = int(ep_idx.item()) if isinstance(ep_idx, torch.Tensor) and ep_idx.numel() == 1 else episode_index
+            fr_v = int(fr_idx.item()) if isinstance(fr_idx, torch.Tensor) and fr_idx.numel() == 1 else i
+
+            print(f"[example] episode_index={ep_v} frame_index={fr_v}")
+            if last_task is not None:
+                print(f"[example] task={last_task!r}")
+            if "observation.state" in raw_batch and isinstance(raw_batch["observation.state"], torch.Tensor):
+                print(f"[example] observation.state={_fmt_tensor_head(raw_batch['observation.state'], max_elems=8)}")
+            if "observation.images.image" in raw_batch and isinstance(raw_batch["observation.images.image"], torch.Tensor):
+                print(f"[example] observation.images.image shape={tuple(raw_batch['observation.images.image'].shape)}")
+            if isinstance(gt_action, torch.Tensor):
+                print(f"[example] gt_action={_fmt_tensor_head(gt_action, max_elems=8)}")
+            if isinstance(pred, torch.Tensor):
+                print(f"[example] pred_action={_fmt_tensor_head(pred, max_elems=8)}")
+            if isinstance(gt_action, torch.Tensor) and isinstance(pred, torch.Tensor):
+                print(f"[example] frame_mae={mae:.6f} frame_mse={mse:.6f}")
+
+    if n > 0:
+        print(
+            f"[example] summary over {n} frames: mean_mae={mae_sum / n:.6f} mean_mse={mse_sum / n:.6f}"
+            + (f" | task={last_task!r}" if last_task is not None else "")
+        )
+    else:
+        print("[example] No frames found for example episode (unexpected).")
 
 
 def _train_steps(
@@ -649,8 +775,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument(
         "--val_split",
         type=float,
-        default=0.1,
+        default=0.0,
         help="Hold out this fraction of episodes for validation (0 disables; split is by episode_index).",
+    )
+    p.add_argument(
+        "--val_episodes",
+        type=int,
+        default=40,
+        help="Hold out this many episodes for validation (overrides --val_split; 0 disables).",
     )
     p.add_argument("--val_seed", type=int, default=None, help="Seed for selecting validation episodes (default: --seed).")
     p.add_argument("--eval_only", action="store_true", help="Only run evaluation (no training / no reinit).")
@@ -670,6 +802,33 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     )
     p.add_argument("--eval_at_end", action="store_true", default=True, help="Run validation at the end of each training phase.")
     p.add_argument("--no_eval_at_end", action="store_true", help="Disable end-of-phase validation.")
+
+    # Example I/O report (offline, from the dataset)
+    p.add_argument(
+        "--print_example_episode",
+        action="store_true",
+        default=True,
+        help="After training/eval, print a small example showing one episode's inputs and predicted vs GT actions.",
+    )
+    p.add_argument("--no_print_example_episode", action="store_true", help="Disable the example episode report.")
+    p.add_argument(
+        "--example_episode_index",
+        type=int,
+        default=None,
+        help="If set, use this episode_index for the example report (must exist in the dataset).",
+    )
+    p.add_argument(
+        "--example_max_frames",
+        type=int,
+        default=25,
+        help="Max frames to evaluate from the example episode (0 = full episode).",
+    )
+    p.add_argument(
+        "--example_print_frames",
+        type=int,
+        default=5,
+        help="How many individual frames to print details for (the rest only contribute to the summary).",
+    )
 
     p.add_argument("--stage1_steps", type=int, default=500)
     p.add_argument("--stage1_lr", type=float, default=1e-4)
@@ -846,19 +1005,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
     val_split = float(args.val_split)
+    val_episodes = args.val_episodes
     val_seed = int(args.val_seed) if args.val_seed is not None else int(args.seed)
     ds_val: Optional[LeRobotDataset] = None
 
-    if val_split > 0:
+    if val_episodes is not None and int(val_episodes) < 0:
+        raise ValueError("--val_episodes must be >= 0")
+
+    want_val = (val_episodes is not None and int(val_episodes) > 0) or (val_episodes is None and val_split > 0)
+    if want_val:
         # Load a tiny slice just to read metadata.total_episodes without mmap'ing the full dataset.
         ds_meta = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, episodes=[0], download_videos=False)
         total_eps = int(ds_meta.meta.total_episodes)
-        train_eps, val_eps = _split_episode_indices(num_episodes=total_eps, val_split=val_split, seed=val_seed)
-        print(f"Episode split: train={len(train_eps)} val={len(val_eps)} (val_split={val_split:g}, seed={val_seed})")
+        train_eps, val_eps = _split_episode_indices(
+            num_episodes=total_eps,
+            val_split=val_split,
+            val_episodes=int(val_episodes) if val_episodes is not None else None,
+            seed=val_seed,
+        )
+        split_desc = f"val_episodes={len(val_eps)}" if val_episodes is not None else f"val_split={val_split:g}"
+        print(f"Episode split: train={len(train_eps)} val={len(val_eps)} ({split_desc}, seed={val_seed})")
         ds = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, episodes=train_eps, download_videos=False)
         ds_val = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, episodes=val_eps, download_videos=False)
     else:
-        print(f"Episode split disabled (val_split={val_split:g}). Using all episodes for training.")
+        print(f"Episode split disabled (val_episodes={val_episodes}, val_split={val_split:g}). Using all episodes for training.")
         ds = LeRobotDataset(repo_id=args.dataset_repo_id, root=dataset_dir, download_videos=False)
 
     dl = _make_dataloader(
@@ -1014,6 +1184,34 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             print(f"[eval] val_loss={val_loss:.6f}{extra}")
         else:
             print("[eval] No validation split configured (set --val_split > 0 to enable).")
+
+        do_example = bool(args.print_example_episode) and not bool(args.no_print_example_episode)
+        if do_example:
+            # Prefer a validation episode if we have one, otherwise just use episode 0.
+            ex_ep = int(args.example_episode_index) if args.example_episode_index is not None else None
+            if ex_ep is None:
+                try:
+                    if ds_val is not None and ds_val.meta.total_episodes > 0:
+                        # If ds_val was constructed from a split, its .episodes list holds the chosen episode indices.
+                        ex_candidates = ds_val.episodes if ds_val.episodes is not None else [0]
+                        ex_ep = int(ex_candidates[0]) if ex_candidates else 0
+                    else:
+                        ex_ep = 0
+                except Exception:
+                    ex_ep = 0
+            print(f"[example] generating example report for episode_index={ex_ep}")
+            _example_episode_report(
+                policy=policy,
+                preprocessor=preprocessor,
+                postprocessor=postprocessor,
+                dataset_dir=dataset_dir,
+                dataset_repo_id=args.dataset_repo_id,
+                episode_index=int(ex_ep),
+                device=device,
+                use_amp=bool(args.use_amp),
+                max_frames=int(args.example_max_frames),
+                print_frames=int(args.example_print_frames),
+            )
         return 0
 
     # Output directories
@@ -1168,8 +1366,42 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             "stage2_lr": float(args.stage2_lr),
             "stage2_soft_prompt_lr_scale": float(args.stage2_soft_prompt_lr_scale),
             "optimizer2": asdict(opt2),
+            "trainable_params": int(n_trainable2),
+            "total_params": int(n_total2),
         },
     )
+
+    print(f"Final model parameters: {n_total2:,} (trainable during phase2: {n_trainable2:,})")
+
+    do_example = bool(args.print_example_episode) and not bool(args.no_print_example_episode)
+    if do_example:
+        # Prefer a held-out validation episode if available; otherwise sample from training episodes.
+        ex_ep = int(args.example_episode_index) if args.example_episode_index is not None else None
+        if ex_ep is None:
+            try:
+                if ds_val is not None and ds_val.episodes:
+                    rng = random.Random(int(args.seed))
+                    ex_ep = int(rng.choice(list(ds_val.episodes)))
+                elif ds.episodes:
+                    rng = random.Random(int(args.seed))
+                    ex_ep = int(rng.choice(list(ds.episodes)))
+                else:
+                    ex_ep = 0
+            except Exception:
+                ex_ep = 0
+        print(f"[example] generating example report for episode_index={ex_ep}")
+        _example_episode_report(
+            policy=policy,
+            preprocessor=preprocessor,
+            postprocessor=postprocessor,
+            dataset_dir=dataset_dir,
+            dataset_repo_id=args.dataset_repo_id,
+            episode_index=int(ex_ep),
+            device=device,
+            use_amp=bool(args.use_amp),
+            max_frames=int(args.example_max_frames),
+            print_frames=int(args.example_print_frames),
+        )
 
     print(f"Done. Saved stage1 -> {stage1_dir} | stage2 -> {stage2_dir}")
     return 0

@@ -21,6 +21,13 @@ Example:
     --raw_data_dir raw_data \
     --dataset_dir lerobot_datasets/grasp_raw \
     --dataset_repo_id grasp_raw \
+    --overwrite_dataset \
+    --canonicalize_task \
+    --gripper_label_mode hybrid \
+    --drop_idle_episodes \
+    --idle_min_sum_dpos_m 0.02 \
+    --idle_min_sum_drot_rad 0.2 \
+    --oversample_gripper_episodes 8 \
     --policy_path lerobot/xvla-base \
     --output_dir outputs/xvla_v1_run \
     --domain_id 29 \
@@ -746,6 +753,50 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--keep_truncated", action="store_true", help="Keep truncated episodes.")
     p.add_argument("--success_only", action="store_true", default=False, help="Only train on episodes with grasp_result.ok=true.")
 
+    # Task/text handling
+    p.add_argument(
+        "--canonicalize_task",
+        action="store_true",
+        default=False,
+        help="Rewrite task strings to a canonical template using instruction.json language_command_meta (reduces prompt entropy).",
+    )
+
+    # Gripper supervision handling
+    p.add_argument(
+        "--gripper_label_mode",
+        type=str,
+        default="action_from_prev",
+        choices=["action_from_prev", "state_change", "hybrid"],
+        help="How to label the gripper action: from logs, from state transitions, or hybrid (prefer logs, else state/user fallback).",
+    )
+    p.add_argument(
+        "--keep_gripperless_episodes",
+        action="store_true",
+        default=True,
+        help="Keep episodes with no non-zero gripper events (recommended if you still want reaching skill).",
+    )
+    p.add_argument(
+        "--drop_gripperless_episodes",
+        action="store_true",
+        help="Drop episodes with no non-zero gripper events (useful to build a grasp-focused dataset).",
+    )
+    p.add_argument(
+        "--oversample_gripper_episodes",
+        type=int,
+        default=1,
+        help="Duplicate episodes that contain any gripper close/open events by this factor (boost grasp signal).",
+    )
+
+    # Quality curation
+    p.add_argument(
+        "--drop_idle_episodes",
+        action="store_true",
+        default=False,
+        help="Drop episodes with near-zero total motion and no gripper events (filters 'sleeping' demos).",
+    )
+    p.add_argument("--idle_min_sum_dpos_m", type=float, default=0.02, help="Idle filter: min total |dpos| sum (m)")
+    p.add_argument("--idle_min_sum_drot_rad", type=float, default=0.2, help="Idle filter: min total |drot| sum (rad)")
+
     # Model / run
     p.add_argument("--policy_path", type=str, default="lerobot/xvla-base")
     p.add_argument("--prefetch_policy", action="store_true", default=True)
@@ -848,7 +899,14 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
 
     # Saving
     p.add_argument("--output_dir", type=str, default="outputs/xvla_v1")
-    p.add_argument("--resume", action="store_true", help="(reserved) kept for interface symmetry with v0")
+    p.add_argument(
+        "--resume",
+        action="store_true",
+        help=(
+            "Resume from --policy_path without reinitializing the selected domain's soft prompt / heads. "
+            "Useful for a second fine-tune pass (e.g. on a grasp-only dataset)."
+        ),
+    )
     return p.parse_args(argv)
 
 
@@ -864,6 +922,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     # Prefetch the policy directory early (so we can validate the "data contract" before conversion).
     policy_path = args.policy_path
+    # Improve UX: if the user passes an absolute filesystem path, require it to exist.
+    # Otherwise HF hub download code will try to interpret it as a repo id and raise a confusing validation error.
+    policy_path_p = Path(str(policy_path)).expanduser()
+    if policy_path_p.is_absolute() and not policy_path_p.is_dir():
+        raise FileNotFoundError(
+            f"--policy_path looks like an absolute local path but is not an existing directory: {policy_path_p}\n"
+            "If you meant to resume from a previous run, pass the real stage2 directory, e.g.\n"
+            "  --policy_path /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/outputs/xvla_v1_run_*/stage2\n"
+            "(Pick one specific stage2 directory that exists; do not use the literal placeholder.)"
+        )
     do_prefetch = bool(args.prefetch_policy) and not bool(args.no_prefetch_policy)
     use_hf_transfer = bool(args.hf_transfer) and not bool(args.no_hf_transfer)
     if do_prefetch and not Path(policy_path).expanduser().resolve().is_dir():
@@ -981,6 +1049,14 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
                 raw_quality_gate=raw_quality_gate,
                 drop_truncated=drop_truncated,
                 success_only=bool(args.success_only),
+                canonicalize_task=bool(getattr(args, "canonicalize_task", False)),
+                gripper_label_mode=str(getattr(args, "gripper_label_mode", "action_from_prev")),
+                keep_gripperless_episodes=bool(getattr(args, "keep_gripperless_episodes", True))
+                and not bool(getattr(args, "drop_gripperless_episodes", False)),
+                oversample_gripper_episodes=int(getattr(args, "oversample_gripper_episodes", 1)),
+                drop_idle_episodes=bool(getattr(args, "drop_idle_episodes", False)),
+                idle_min_sum_dpos_m=float(getattr(args, "idle_min_sum_dpos_m", 0.02)),
+                idle_min_sum_drot_rad=float(getattr(args, "idle_min_sum_drot_rad", 0.2)),
                 max_episodes=args.max_episodes,
                 min_frames_per_episode=min_frames_per_episode,
                 max_frames_per_episode=args.max_frames_per_episode,
@@ -1222,22 +1298,30 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     # -------------------------
     # Phase 1: prompt + heads only
     # -------------------------
-    print(f"Phase 1: reinitializing domain={domain_id} soft prompt + training only prompt + action heads (frozen backbone)")
-
-    # Re-init the *new* soft prompt row for our robot/scenario.
-    _reinit_soft_prompt_row(policy, domain_id=domain_id, std=0.02)
+    if bool(args.resume):
+        print(
+            f"Phase 1: resume mode (domain={domain_id}) -> NOT reinitializing soft prompt / action heads; "
+            "will run phase-1 optimization on existing weights."
+        )
+    else:
+        print(
+            f"Phase 1: reinitializing domain={domain_id} soft prompt + training only prompt + action heads (frozen backbone)"
+        )
+        # Re-init the *new* soft prompt row for our robot/scenario.
+        _reinit_soft_prompt_row(policy, domain_id=domain_id, std=0.02)
 
     # Also (optionally) treat domain-specific action encoder/decoder as new "small action projection heads"
-    # by reinitializing only the selected domain row.
+    # by reinitializing only the selected domain row (skip in --resume mode).
     transformer = getattr(getattr(policy, "model", None), "transformer", None)
     if transformer is None:
         raise RuntimeError("Unexpected policy structure: missing policy.model.transformer")
-    _reinit_domain_aware_linear_row(transformer.action_encoder, domain_id=domain_id)
-    _reinit_domain_aware_linear_row(transformer.action_decoder, domain_id=domain_id)
-    if getattr(transformer, "use_hetero_proj", False):
-        # These are domain-conditioned projection heads when enabled.
-        _reinit_domain_aware_linear_row(transformer.vlm_proj, domain_id=domain_id)
-        _reinit_domain_aware_linear_row(transformer.aux_visual_proj, domain_id=domain_id)
+    if not bool(args.resume):
+        _reinit_domain_aware_linear_row(transformer.action_encoder, domain_id=domain_id)
+        _reinit_domain_aware_linear_row(transformer.action_decoder, domain_id=domain_id)
+        if getattr(transformer, "use_hetero_proj", False):
+            # These are domain-conditioned projection heads when enabled.
+            _reinit_domain_aware_linear_row(transformer.vlm_proj, domain_id=domain_id)
+            _reinit_domain_aware_linear_row(transformer.aux_visual_proj, domain_id=domain_id)
 
     # Freeze everything except the prompt + action heads.
     _mark_trainable(

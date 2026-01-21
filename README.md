@@ -56,14 +56,71 @@ python train_scripts/X-VLA/X_VLA_v1.py --model_id <HF_OR_LOCAL_XVLA_ID> --dry_ru
 
 ### LeRobot X-VLA (XVLA v1)
 
-If you already converted `raw_data/` into a LeRobotDataset, you can skip rebuilding the dataset and train with a fixed validation holdout (40 episodes):
+#### Rebuild LeRobot datasets (grasp boosting / grasp-only)
+
+Build the full dataset with grasp-signal boosting + drop idle (“sleeping”) episodes:
 
 ```bash
-python train_scripts/lerobot-xvla/xvla-v1.py \
-  --skip_convert \
-  --dataset_dir lerobot_datasets/grasp_raw \
+python /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/train_scripts/lerobot-xvla/convert_raw_data_to_lerobot_dataset.py \
+  --raw_data_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/raw_data \
+  --out_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/lerobot_datasets/grasp_raw \
+  --repo_id grasp_raw \
+  --fps 5 \
+  --overwrite \
+  --canonicalize_task \
+  --gripper_label_mode hybrid \
+  --drop_idle_episodes \
+  --idle_min_sum_dpos_m 0.02 \
+  --idle_min_sum_drot_rad 0.2 \
+  --oversample_gripper_episodes 8
+```
+
+Build a grasp-only dataset (drops episodes with no gripper close/open events):
+
+```bash
+python /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/train_scripts/lerobot-xvla/convert_raw_data_to_lerobot_dataset.py \
+  --raw_data_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/raw_data \
+  --out_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/lerobot_datasets/grasp_only \
+  --repo_id grasp_only \
+  --fps 5 \
+  --overwrite \
+  --canonicalize_task \
+  --gripper_label_mode hybrid \
+  --drop_gripperless_episodes \
+  --oversample_gripper_episodes 1
+```
+
+#### Train (stage1 -> stage2) without overwriting datasets
+
+Train on `grasp_raw` (uses the existing dataset on disk; no rebuild / no overwrite):
+
+```bash
+python /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/train_scripts/lerobot-xvla/xvla-v1.py \
+  --raw_data_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/raw_data \
+  --dataset_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/lerobot_datasets/grasp_raw \
   --dataset_repo_id grasp_raw \
-  --policy_path lerobot/xvla-base \
-  --output_dir outputs/xvla_v1_run \
-  --val_episodes 40
+  --skip_convert \
+  --device cuda \
+  --domain_id 29 \
+  --output_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/outputs/xvla_v1_run \
+  --stage1_steps 500 \
+  --stage2_steps 2500
+```
+
+Optional second fine-tune pass on `grasp_only` (start from the previous run's `stage2` directory):
+
+```bash
+python /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/train_scripts/lerobot-xvla/xvla-v1.py \
+  # IMPORTANT: replace this placeholder with the real stage2 folder from your first run (it must exist on disk)
+  --policy_path /PATH/TO/FIRST_RUN/stage2 \
+  --raw_data_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/raw_data \
+  --dataset_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/lerobot_datasets/grasp_only \
+  --dataset_repo_id grasp_only \
+  --skip_convert \
+  --resume \
+  --device cuda \
+  --domain_id 29 \
+  --output_dir /home/kye/Desktop/Depo/Code/Grasp-VLA/Grasp-VLA/outputs/xvla_v1_grasp_only \
+  --stage1_steps 0 \
+  --stage2_steps 1500
 ```
